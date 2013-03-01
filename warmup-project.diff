@@ -1,0 +1,1109 @@
+diff --git a/SConstruct b/SConstruct
+index bd5667d..15f38fa 100644
+--- a/SConstruct
++++ b/SConstruct
+@@ -148,11 +148,15 @@ if ptlsim_lib == None:
+ plugin_compile_script = "plugins/SConscript"
+ plugins = SConscript(plugin_compile_script)
+ 
++hwlib_compile_script = "systemc/SConscript"
++hwlib = SConscript(hwlib_compile_script)
++
+ # 3. Compile QEMU
+ qemu_compile_script = "%s/SConstruct" % qemu_dir
+ qemu_target = {}
+ Export('ptlsim_lib')
+ Export('plugins')
++Export('hwlib')
+ ptlsim_inc_dir = "%s/sim" % ptl_dir
+ Export('ptlsim_inc_dir')
+ 
+diff --git a/config/default.conf b/config/default.conf
+index f597bf3..1cdde03 100644
+--- a/config/default.conf
++++ b/config/default.conf
+@@ -59,6 +59,49 @@ machine:
+             - L2_0: LOWER
+               MEM_0: UPPER
+ 
++  single_atom:
++    description: Single Core configuration 
++    min_contexts: 1
++    max_contexts: 1
++    cores: # The order in which core is defined is used to assign
++           # the cores in a machine
++      - type: atom
++        name_prefix: atom_
++        option:
++            threads: 1
++    caches:
++      - type: l1_128K
++        name_prefix: L1_I_
++        insts: $NUMCORES # Per core L1-I cache
++      - type: systemc_l1
++#      - type: l1_64K
++        name_prefix: L1_D_
++        insts: $NUMCORES # Per core L1-D cache
++      - type: l2_2M
++        name_prefix: L2_
++        insts: 1 # Shared L2 config
++    memory:
++      - type: dram_cont
++        name_prefix: MEM_
++        insts: 1 # Single DRAM controller
++        option:
++            latency: 50 # In nano seconds
++    interconnects:
++      - type: p2p
++        # '$' sign is used to map matching instances like:
++        # core_0, L1_I_0
++        connections:
++            - core_$: I
++              L1_I_$: UPPER
++            - core_$: D
++              L1_D_$: UPPER
++            - L1_I_0: LOWER
++              L2_0: UPPER
++            - L1_D_0: LOWER
++              L2_0: UPPER2
++            - L2_0: LOWER
++              MEM_0: UPPER
++
+   ooo_2_th:
+     description: Out-of-order core with 2 threads
+     min_contexts: 2
+diff --git a/config/l1_cache.conf b/config/l1_cache.conf
+index 5ce209e..4d942ce 100644
+--- a/config/l1_cache.conf
++++ b/config/l1_cache.conf
+@@ -1,6 +1,24 @@
+ # vim: filetype=yaml
+ 
+ cache:
++  systemc_l1:
++    base: wb_cache
++    params:
++      SIZE: 64K
++      LINE_SIZE: 64 # bytes
++      ASSOC: 1
++      LATENCY: 1
++      READ_PORTS: 0
++      WRITE_PORTS: -1
++  l1_64K:
++    base: wb_cache
++    params:
++      SIZE: 64K
++      LINE_SIZE: 64 # bytes
++      ASSOC: 1
++      LATENCY: 1
++      READ_PORTS: 1
++      WRITE_PORTS: -1
+   l1_128K:
+     base: wb_cache
+     params:
+diff --git a/config_helper.py b/config_helper.py
+index ce622fe..f8a5086 100644
+--- a/config_helper.py
++++ b/config_helper.py
+@@ -23,7 +23,7 @@ import copy
+ 
+ # Module local variables and functions
+ _required_cache_params = [
+-        'SIZE', 'LINE_SIZE', 'ASSOC', 'LATENCY', 'READ_PORTS', 'WRITE_PORTS']
++        'SIZE', 'LINE_SIZE', 'ASSOC', 'LATENCY', 'WRITE_PORTS']
+ _required_mem_params = ['LATENCY']
+ _required_keys = {
+         'config': ['core', 'cache', 'machine', 'memory'],
+diff --git a/ptlsim/SConstruct b/ptlsim/SConstruct
+index e427c93..6e2621c 100644
+--- a/ptlsim/SConstruct
++++ b/ptlsim/SConstruct
+@@ -25,9 +25,10 @@ env['CPPPATH'].append(qemu_dir)
+ env['CPPPATH'].append("%s/%s" % (qemu_dir, "target-i386"))
+ env['CPPPATH'].append("%s/%s" % (qemu_dir, "fpu"))
+ env['CPPPATH'].append("%s/%s" % (qemu_dir, "x86_64-softmmu"))
++env['CPPPATH'].append("%s/.." % qemu_dir)
+ 
+ optimization_defs = '-fno-trapping-math -fstack-protector -fno-exceptions '
+-optimization_defs += '-fno-rtti -funroll-loops -fstrict-aliasing '
++optimization_defs += '-funroll-loops -fstrict-aliasing '
+ 
+ debug = ARGUMENTS.get('debug', 0)
+ if int(debug):
+diff --git a/ptlsim/cache/cacheController.cpp b/ptlsim/cache/cacheController.cpp
+index 48e77f7..96ae1cc 100644
+--- a/ptlsim/cache/cacheController.cpp
++++ b/ptlsim/cache/cacheController.cpp
+@@ -368,8 +368,10 @@ int CacheController::access_fast_path(Interconnect *interconnect,
+         return -1;
+     }
+ 
++    bool dummy;
+     if (request->get_type() != MEMORY_OP_WRITE)
+-        hit = cacheLines_->probe(request);
++    if (cacheLines_->has_fast_path())
++        hit = cacheLines_->probe(request, false, 0, dummy);
+ 
+ 	// TESTING
+     //	hit = true;
+@@ -488,10 +490,13 @@ bool CacheController::cache_insert_cb(void *arg)
+         goto retry_insert;
+     }
+ 
+-	if(cacheLines_->get_port(queueEntry->request)) {
++	if(queueEntry->sent || cacheLines_->get_port(queueEntry->request)) {
+ 		W64 oldTag = InvalidTag<W64>::INVALID;
++		bool ready;
+ 		CacheLine *line = cacheLines_->insert(queueEntry->request,
+-				oldTag);
++				oldTag, LINE_VALID, cacheLines_->tagOf(queueEntry->request->get_physical_address()), ready);
++		if (!cacheLines_->has_fast_path()) queueEntry->sent = true;
++		if (!ready) goto retry_insert;
+ 		if(oldTag != InvalidTag<W64>::INVALID && oldTag != (W64)-1) {
+             if(wt_disabled_ && line->state == LINE_MODIFIED) {
+                 send_update_message(queueEntry, oldTag);
+@@ -503,6 +508,7 @@ bool CacheController::cache_insert_cb(void *arg)
+                     get_physical_address()));
+ 
+ 		queueEntry->eventFlags[CACHE_INSERT_COMPLETE_EVENT]++;
++		queueEntry->sent = false;
+ 		marss_add_event(&cacheInsertComplete_,
+ 				cacheAccessLatency_, queueEntry);
+ 		return true;
+@@ -538,15 +544,20 @@ bool CacheController::cache_access_cb(void *arg)
+ 
+ 	queueEntry->eventFlags[CACHE_ACCESS_EVENT]--;
+ 
+-	if(cacheLines_->get_port(queueEntry->request)) {
+-		CacheLine *line = cacheLines_->probe(queueEntry->request);
++	bool ready;
++	CacheLine *line;
++	OP_TYPE type = queueEntry->request->get_type();
++	if(
++		(queueEntry->sent || cacheLines_->get_port(queueEntry->request))
++		&& (((line = cacheLines_->probe(queueEntry->request, (wt_disabled_ && (type == MEMORY_OP_WRITE || type == MEMORY_OP_UPDATE)) || (type == MEMORY_OP_EVICT && is_private()), (type == MEMORY_OP_EVICT)?LINE_NOT_VALID:LINE_MODIFIED, ready)) || (true)) && (cacheLines_->has_fast_path() || (queueEntry->sent = true)))
++		&& ready
++	) {
+ 		bool hit = (line == NULL) ? false : line->state;
+ 
+ 		// Testing 100 % L2 Hit
+         //		if(type_ == L2_CACHE)
+         //			hit = true;
+ 
+-		OP_TYPE type = queueEntry->request->get_type();
+ 		bool kernel_req = queueEntry->request->is_kernel();
+ 		Signal *signal = NULL;
+ 		int delay;
+@@ -638,6 +649,7 @@ bool CacheController::cache_access_cb(void *arg)
+                 }
+ 			}
+ 		}
++		queueEntry->sent = false;
+ 		marss_add_event(signal, delay,
+ 				(void*)queueEntry);
+ 		return true;
+diff --git a/ptlsim/cache/cacheController.h b/ptlsim/cache/cacheController.h
+index 97af18b..beccce9 100644
+--- a/ptlsim/cache/cacheController.h
++++ b/ptlsim/cache/cacheController.h
+@@ -78,6 +78,7 @@ struct CacheQueueEntry : public FixStateListObject
+ 		Controller    *source;
+ 		Controller    *dest;
+ 		bool annuled;
++		bool sent;
+ 		bool prefetch;
+ 		bool prefetchCompleted;
+ 
+@@ -91,6 +92,7 @@ struct CacheQueueEntry : public FixStateListObject
+             dependsAddr = -1;
+ 			eventFlags.reset();
+ 			annuled = false;
++			sent = false;
+ 			prefetch = false;
+ 			prefetchCompleted = false;
+ 		}
+diff --git a/ptlsim/cache/cacheLines.h b/ptlsim/cache/cacheLines.h
+index 5147321..74fec9b 100644
+--- a/ptlsim/cache/cacheLines.h
++++ b/ptlsim/cache/cacheLines.h
+@@ -29,6 +29,10 @@
+ #define CACHE_LINES_H
+ 
+ #include <logic.h>
++#include "systemc/wrapper.h"
++
++extern ofstream mylogfile;
++#define cacheline_logfile if (0) mylogfile
+ 
+ namespace Memory {
+ 
+@@ -39,6 +43,9 @@ namespace Memory {
+          * coherence state */
+         W8 state;
+ 
++        CacheLine(): tag(-1), state(0) { }
++        CacheLine(W64 _tag, W8 _state): tag(_tag), state(_state) { }
++
+         void init(W64 tag_t) {
+             tag = tag_t;
+             if (tag == (W64)-1) state = 0;
+@@ -77,18 +84,18 @@ namespace Memory {
+             virtual void init()=0;
+             virtual W64 tagOf(W64 address)=0;
+             virtual int latency() const =0;
+-            virtual CacheLine* probe(MemoryRequest *request)=0;
+-            virtual CacheLine* insert(MemoryRequest *request,
+-                    W64& oldTag)=0;
++            virtual CacheLine* probe(MemoryRequest *request, bool update_state, W8 new_state, bool& ready)=0;
++            virtual CacheLine* insert(MemoryRequest *request, W64& oldTag, W8 new_state, W64 new_tag, bool& ready)=0;
+             virtual int invalidate(MemoryRequest *request)=0;
++            virtual bool has_fast_path()=0;
+             virtual bool get_port(MemoryRequest *request)=0;
+             virtual void print(ostream& os) const =0;
+             virtual int get_line_bits() const=0;
+             virtual int get_access_latency() const=0;
+-			virtual int get_size() const=0;
+-			virtual int get_set_count() const=0;
+-			virtual int get_way_count() const=0;
+-			virtual int get_line_size() const=0;
++            virtual int get_size() const=0;
++            virtual int get_set_count() const=0;
++            virtual int get_way_count() const=0;
++            virtual int get_line_size() const=0;
+     };
+ 
+     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+@@ -101,7 +108,9 @@ namespace Memory {
+             int writePortUsed_;
+             int readPorts_;
+             int writePorts_;
++            bool systemc_proxy;
+             W64 lastAccessCycle_;
++            CacheLine templine;
+ 
+         public:
+             typedef AssociativeArray<W64, CacheLine, SET_COUNT,
+@@ -114,47 +123,48 @@ namespace Memory {
+             void init();
+             W64 tagOf(W64 address);
+             int latency() const { return LATENCY; };
+-            CacheLine* probe(MemoryRequest *request);
+-            CacheLine* insert(MemoryRequest *request, W64& oldTag);
++            CacheLine* probe(MemoryRequest *request, bool update_state, W8 new_state, bool& ready);
++            CacheLine* insert(MemoryRequest *request, W64& oldTag, W8 new_state, W64 new_tag, bool& ready);
+             int invalidate(MemoryRequest *request);
++            bool has_fast_path();
+             bool get_port(MemoryRequest *request);
+             void print(ostream& os) const;
+ 
+-			/**
+-			 * @brief Get Cache Size
+-			 *
+-			 * @return Size of Cache in bytes
+-			 */
+-			int get_size() const {
+-				return (SET_COUNT * WAY_COUNT * LINE_SIZE);
+-			}
+-
+-			/**
+-			 * @brief Get Number of Sets in Cache
+-			 *
+-			 * @return Sets in Cache
+-			 */
+-			int get_set_count() const {
+-				return SET_COUNT;
+-			}
+-
+-			/**
+-			 * @brief Get Cache Lines per Set (Number of Ways)
+-			 *
+-			 * @return Number of Cache Lines in one Set
+-			 */
+-			int get_way_count() const {
+-				return WAY_COUNT;
+-			}
+-
+-			/**
+-			 * @brief Get number of bytes in a cache line
+-			 *
+-			 * @return Number of bytes in Cache Line
+-			 */
+-			int get_line_size() const {
+-				return LINE_SIZE;
+-			}
++            /**
++             * @brief Get Cache Size
++             *
++             * @return Size of Cache in bytes
++             */
++            int get_size() const {
++              return (SET_COUNT * WAY_COUNT * LINE_SIZE);
++            }
++
++            /**
++             * @brief Get Number of Sets in Cache
++             *
++             * @return Sets in Cache
++             */
++            int get_set_count() const {
++              return SET_COUNT;
++            }
++
++            /**
++             * @brief Get Cache Lines per Set (Number of Ways)
++             *
++             * @return Number of Cache Lines in one Set
++             */
++            int get_way_count() const {
++              return WAY_COUNT;
++            }
++
++            /**
++             * @brief Get number of bytes in a cache line
++             *
++             * @return Number of bytes in Cache Line
++             */
++            int get_line_size() const {
++              return LINE_SIZE;
++            }
+ 
+             int get_line_bits() const {
+                 return log2(LINE_SIZE);
+@@ -187,10 +197,15 @@ namespace Memory {
+         CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::CacheLines(int readPorts, int writePorts) :
+             readPorts_(readPorts)
+             , writePorts_(writePorts)
++            , systemc_proxy(false)
+     {
+         lastAccessCycle_ = 0;
+         readPortUsed_ = 0;
+         writePortUsed_ = 0;
++        if (writePorts < 0) {
++          writePorts_ = -writePorts_;
++          systemc_proxy = true;
++        }
+     }
+ 
+     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+@@ -213,35 +228,112 @@ namespace Memory {
+ 
+     // Return true if valid line is found, else return false
+     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+-        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::probe(MemoryRequest *request)
++        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::probe(MemoryRequest *request, bool update_state, W8 new_state, bool& ready)
+         {
+             W64 physAddress = request->get_physical_address();
++            if (systemc_proxy) {
++              cacheline_logfile << "probe: " << *request << " update_state: " << update_state << " new_state: " << (int)new_state << " physAddress=" << physAddress << endl;
++              systemc_request& req(systemc_requests[physAddress]);
++              if (!req.sent) {
++                  cacheline_logfile << "sending probe..." << endl;
++                  req.type = systemc_request::SYSTEMC_CACHE_PROBE;
++                  OP_TYPE type = request->get_type();
++                  req.has_data = ((type == MEMORY_OP_WRITE) || (type == MEMORY_OP_UPDATE)) ;
++                  req.needs_data = (type == MEMORY_OP_READ);
++                  req.physAddress = physAddress;
++                  req.update_state = update_state;
++                  req.new_state = new_state;
++                  systemc_request_submit(physAddress);
++                  req.sent = true;
++                  ready = false;
++                  return NULL;
++              }
++              ready = req.reply_ready;
++              cacheline_logfile << "sent, ready? " << ready << " reply_tag: " << std::hex << req.reply_tag << endl;
++              templine.tag = req.reply_tag;
++              templine.state = req.reply_state;
++              if (ready) {
++                req.sent = false;
++                systemc_requests.erase(physAddress);
++                cacheline_logfile << "systemc_requests.size() == " << systemc_requests.size() << endl;
++              }
++              if (templine.tag == 0) return NULL;
++              if (ready) cacheline_logfile << "... hit" << endl;
++              return &templine;
++            }
+             CacheLine *line = base_t::probe(physAddress);
+ 
++            ready = true;
+             return line;
+         }
+ 
+     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+-        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::insert(MemoryRequest *request, W64& oldTag)
++        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::insert(MemoryRequest *request, W64& oldTag, W8 new_state, W64 new_tag, bool& ready)
+         {
+             W64 physAddress = request->get_physical_address();
++            if (systemc_proxy) {
++              cacheline_logfile << "insert: " << *request << " new_state: " << (int)new_state << endl;
++              systemc_request& req(systemc_requests[physAddress]);
++              if (!req.sent) {
++                  cacheline_logfile << "sending insert..." << endl;
++                  req.type = systemc_request::SYSTEMC_CACHE_INSERT;
++                  req.has_data = true;
++                  req.needs_data = false;
++                  req.physAddress = physAddress;
++                  req.update_state = true;
++                  req.new_state = new_state;
++                  systemc_request_submit(physAddress);
++                  req.sent = true;
++                  ready = false;
++                  return NULL;
++              }
++              ready = req.reply_ready;
++              cacheline_logfile << "sent, ready? " << ready << " reply_tag: " << std::hex << req.reply_tag << endl;
++              templine.tag = oldTag = req.reply_tag;
++              templine.state = req.reply_state;
++              if (ready) {
++                req.sent = false;
++                systemc_requests.erase(physAddress);
++                assert(systemc_requests.size() < 1000);
++                cacheline_logfile << "systemc_requests.size() == " << systemc_requests.size() << endl;
++              }
++              return &templine;
++            }
+             CacheLine *line = base_t::select(physAddress, oldTag);
+ 
++            ready = true;
+             return line;
+         }
+ 
+     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+         int CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::invalidate(MemoryRequest *request)
+         {
++            assert(!systemc_proxy);
+             return base_t::invalidate(request->get_physical_address());
+         }
+ 
++    template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
++        bool CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::has_fast_path()
++        {
++            return !systemc_proxy;
++        }
+ 
+     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+         bool CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::get_port(MemoryRequest *request)
+         {
+             bool rc = false;
+ 
++            if (systemc_proxy) {
++                for(int p=systemc_base_port; p<(readPorts_+writePorts_); ++p) {
++                    if (systemc_port_available[p])  {
++cacheline_logfile << "getport: " << *request << " available on " << p << endl;
++												return true;
++										}
++								}
++cacheline_logfile << "getport: " << *request << " all busy" << endl;
++                return false;
++            }
++
+             if(lastAccessCycle_ < sim_cycle) {
+                 lastAccessCycle_ = sim_cycle;
+                 writePortUsed_ = 0;
+@@ -251,6 +343,9 @@ namespace Memory {
+             switch(request->get_type()) {
+                 case MEMORY_OP_READ:
+                     rc = (readPortUsed_ < readPorts_) ? ++readPortUsed_ : 0;
++                    if (!rc) {
++                        rc = (writePortUsed_ < writePorts_) ? ++writePortUsed_ : 0;
++                    }
+                     break;
+                 case MEMORY_OP_WRITE:
+                 case MEMORY_OP_UPDATE:
+@@ -262,6 +357,7 @@ namespace Memory {
+                             request->get_type() << endl);
+                     assert(0);
+             };
++
+             return rc;
+         }
+ 
+diff --git a/ptlsim/cache/coherentCache.cpp b/ptlsim/cache/coherentCache.cpp
+index f548577..7760ea8 100644
+--- a/ptlsim/cache/coherentCache.cpp
++++ b/ptlsim/cache/coherentCache.cpp
+@@ -366,8 +366,9 @@ bool CacheController::complete_request(Message &message,
+     if(queueEntry->line == NULL || queueEntry->line->tag !=
+             cacheLines_->tagOf(queueEntry->request->get_physical_address())) {
+         W64 oldTag = InvalidTag<W64>::INVALID;
++        bool dummy;
+         CacheLine *line = cacheLines_->insert(queueEntry->request,
+-                oldTag);
++                oldTag, 0, 0, dummy);
+ 
+         /* If line is in use then don't evict it, it will be inserted later. */
+         if (is_line_in_use(oldTag)) {
+@@ -425,8 +426,9 @@ int CacheController::access_fast_path(Interconnect *interconnect,
+         return -1;
+     }
+ 
++    bool dummy;
+     if (request->get_type() != MEMORY_OP_WRITE)
+-        line = cacheLines_->probe(request);
++        line = cacheLines_->probe(request, false, 0, dummy);
+ 
+     /*
+      * if its a write, dont do fast access as the lower
+@@ -636,7 +638,8 @@ bool CacheController::cache_access_cb(void *arg)
+ 
+     if(cacheLines_->get_port(queueEntry->request)) {
+         bool hit;
+-        CacheLine *line	= cacheLines_->probe(queueEntry->request);
++        bool dummy;
++        CacheLine *line	= cacheLines_->probe(queueEntry->request, false, 0, dummy);
+         queueEntry->line = line;
+ 
+         if(line) hit = true;
+diff --git a/ptlsim/lib/superstl.cpp b/ptlsim/lib/superstl.cpp
+index 2f09fde..0bf881f 100644
+--- a/ptlsim/lib/superstl.cpp
++++ b/ptlsim/lib/superstl.cpp
+@@ -342,11 +342,11 @@ namespace superstl {
+       memcpy(os.p, buf, len);
+       os.p += len;
+       width = max(width - len, 0);
+-      memset(os.p, ' ', width);
++      if (width) memset(os.p, ' ', width);
+       os.p += width;
+     } else {
+       width = max(width - len, 0);
+-      memset(os.p, ' ', width);
++      if (width) memset(os.p, ' ', width);
+       os.p += width;
+       memcpy(os.p, buf, len);
+       os.p += len;
+@@ -369,11 +369,11 @@ namespace superstl {
+       memcpy(os.p, buf, len);
+       os.p += len;
+       width = max(width - len, 0);
+-      memset(os.p, ' ', width);
++      if (width) memset(os.p, ' ', width);
+       os.p += width;
+     } else {
+       width = max(width - len, 0);
+-      memset(os.p, ' ', width);
++      if (width) memset(os.p, ' ', width);
+       os.p += width;
+       memcpy(os.p, buf, len);
+       os.p += len;
+@@ -395,11 +395,11 @@ namespace superstl {
+       memcpy(os.p, s.value, len);
+       os.p += len;
+       width = max(width - len, 0);
+-      memset(os.p, s.pad, width);
++      if (width) memset(os.p, s.pad, width);
+       os.p += width;
+     } else {
+       width = max(width - len, 0);
+-      memset(os.p, s.pad, width);
++      if (width) memset(os.p, s.pad, width);
+       os.p += width;
+       memcpy(os.p, s.value, len);
+       os.p += len;
+diff --git a/ptlsim/sim/machine.cpp b/ptlsim/sim/machine.cpp
+index dfa2a7d..1e27763 100644
+--- a/ptlsim/sim/machine.cpp
++++ b/ptlsim/sim/machine.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include <cstdarg>
+ 
++#include "systemc/wrapper.h"
++
+ using namespace Core;
+ using namespace Memory;
+ 
+@@ -229,6 +231,7 @@ int BaseMachine::run(PTLsimConfig& config)
+     // Run each core
+     bool exiting = false;
+ 
++    systemc_reset();
+     for (;;) {
+         if unlikely ((!logenable) &&
+                 iterations >= config.start_log_at_iteration &&
+@@ -265,6 +268,7 @@ int BaseMachine::run(PTLsimConfig& config)
+ 			exiting |= coremodel.per_cycle_signals[i]->emit(NULL);
+ 		}
+ 
++        systemc_clock();
+         sim_cycle++;
+         iterations++;
+ 
+diff --git a/qemu/SConstruct b/qemu/SConstruct
+index 62e0a5c..0c1dd55 100644
+--- a/qemu/SConstruct
++++ b/qemu/SConstruct
+@@ -5,6 +5,7 @@ Import('qemu_env')
+ Import('qemu_target')
+ Import('ptlsim_lib')
+ Import('plugins')
++Import('hwlib')
+ Import('ptlsim_inc_dir')
+ env = qemu_env
+ target = qemu_target
+@@ -474,7 +475,8 @@ env.Append(LIBPATH = "%s/../plugins" % env['source_path'])
+ env.Append(LINKFLAGS = "-Wl,-rpath=%s/../plugins" % env['source_path'])
+ env.Append(LINKFLAGS = "-Wl,--no-as-needed")
+ env.Append(LIBS = plugins)
+-env['ARLIB'] = libqemu_comm + libqemu + ptlsim_lib
++env.Append(LINKFLAGS = "-Wl,-rpath=/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -L/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -lsystemc")
++env['ARLIB'] = libqemu_comm + libqemu + ptlsim_lib + hwlib
+ qemu_bin = env.QEMU_BIN(qemu_prog_name, hw_files_o + pc_bios_objs +
+         trace_o)
+ env.Depends(qemu_bin, env['ARLIB'])
+diff --git a/qemu/slirp/misc.c b/qemu/slirp/misc.c
+index 19dbec4..90b3c89 100644
+--- a/qemu/slirp/misc.c
++++ b/qemu/slirp/misc.c
+@@ -394,7 +394,7 @@ void slirp_connection_info(Slirp *slirp, Monitor *mon)
+             dst_addr = so->so_faddr;
+             dst_port = so->so_fport;
+         }
+-        memset(&buf[n], ' ', 19 - n);
++        if (19-n) memset(&buf[n], ' ', 19 - n);
+         buf[19] = 0;
+         monitor_printf(mon, "%s %3d %15s %5d ", buf, so->s,
+                        src.sin_addr.s_addr ? inet_ntoa(src.sin_addr) : "*",
+diff --git a/qemu/vl.c b/qemu/vl.c
+index ab77653..7eaabac 100644
+--- a/qemu/vl.c
++++ b/qemu/vl.c
+@@ -114,6 +114,8 @@ int main(int argc, char **argv)
+ #define main qemu_main
+ #endif /* CONFIG_COCOA */
+ 
++#include "systemc/wrapper.h"
++
+ #include "hw/hw.h"
+ #include "hw/boards.h"
+ #include "hw/usb.h"
+@@ -1453,6 +1455,7 @@ static void main_loop(void)
+ #endif
+             nonblocking = cpu_exec_all();
+ #ifdef MARSS_QEMU
++#define main systemc_main
+             }
+ #endif
+ #endif
+diff --git a/systemc/SConscript b/systemc/SConscript
+new file mode 100644
+index 0000000..ba9d55a
+--- /dev/null
++++ b/systemc/SConscript
+@@ -0,0 +1,27 @@
++# SConscript for plugins subdirectory
++
++# Import envrionment
++try:
++	Import('ptl_env')
++	env = ptl_env
++except:
++    print("Plugin directory can't get base environment")
++    exit(0)
++
++import os
++from subprocess import call
++
++env['CPPPATH'].append("/home/stufs1/crfitzsimons/cse502/systemc/include")
++
++# Get list of .cpp files
++src_files = Glob('*.cpp')
++
++hwlib = env.SharedLibrary(target='hwlib', source=src_files)
++
++testbench = env.Clone();
++testbench.Append(LINKFLAGS = "-Wl,-rpath=/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -L/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -lsystemc")
++testbench.Append(LINKFLAGS = "-Wl,-rpath=%s -L%s -lhwlib" % (os.getcwd(),os.getcwd()))
++tb = testbench.Program(target = "testbench", source = ["testbench.c"]);
++testbench.Depends(tb, hwlib)
++
++Return('hwlib')
+diff --git a/systemc/cache.h b/systemc/cache.h
+new file mode 100644
+index 0000000..939a506
+--- /dev/null
++++ b/systemc/cache.h
+@@ -0,0 +1,61 @@
++#ifndef _CACHE_H
++#define _CACHE_H
++
++#include "systemc"
++#include "sram.h"
++
++#include <iostream>
++using namespace std;
++
++extern ofstream mylogfile;
++#define sysc_logfile if (0) mylogfile
++
++using namespace sc_core;
++using namespace sc_dt;
++
++#define ENABLE_SYSTEMC_CACHE
++
++class Cache : public sc_module
++{
++	typedef Cache SC_CURRENT_USER_MODULE;
++
++	virtual void work() = 0;
++public:
++	static const int block_size = 64;
++	static const int ports = 2;
++
++	static const int depthLog2 = 7;
++	static const int idx_mask = (1<<depthLog2)-1;
++
++	sc_in<bool>          clk;
++	sc_in<bool>          reset;
++
++	sc_signal<bool>      port_available[ports];
++
++	sc_in<bool>          in_ena[ports];
++	sc_in<bool>          in_is_insert[ports];
++	sc_in<bool>          in_has_data[ports];
++	sc_in<bool>          in_needs_data[ports];
++	sc_in<sc_uint<64> >  in_addr[ports];
++	sc_in<sc_uint<64> >  in_data[ports];
++	sc_in<bool>          in_update_state[ports];
++	sc_in<sc_uint<8> >   in_new_state[ports];
++	sc_out<bool>         out_ready[ports];
++	sc_out<sc_uint<64> > out_addr[ports];
++	sc_out<sc_bv<8*block_size> >   out_data[ports];
++	sc_out<sc_uint<64> > out_token[ports];
++	sc_out<sc_uint<8> >  out_state[ports];
++
++	Cache(const sc_module_name &name)
++	:	sc_module(name)
++	{
++		SC_METHOD(work); sensitive << clk.pos();
++		for(int p=0; p<ports; ++p)
++			port_available[p] = false;
++	}
++};
++
++class CacheProject: public Cache
++{};
++
++#endif
+diff --git a/systemc/sram.h b/systemc/sram.h
+new file mode 100644
+index 0000000..9599f80
+--- /dev/null
++++ b/systemc/sram.h
+@@ -0,0 +1,53 @@
++#ifndef _SRAM_H
++#define _SRAM_H
++
++#include "systemc"
++using namespace sc_core;
++using namespace sc_dt;
++
++template<int width, int depthLog2, int ports>
++class SRAM : public sc_module {
++	typedef SRAM SC_CURRENT_USER_MODULE;
++
++	static const int delay = (depthLog2-8>0?depthLog2-8:1)*(ports>1?(ports>2?(ports>3?10:2):1.4):1);
++
++	typedef sc_bv<width> Row;
++	Row data[1<<depthLog2];
++	typedef sc_uint<depthLog2> Addr;
++
++	typedef sc_bv<width> pipeline_t[delay];
++	pipeline_t pipeline[ports];
++	int pipe_ptr;
++
++	void work() {
++		for(int p=0; p<ports; ++p) {
++			if (!ena[p]) continue;
++			if (we[p]) data[addr[p].read()] = din[p].read();
++			(pipeline[p])[pipe_ptr] = data[addr[p].read()];
++		}
++		pipe_ptr = (pipe_ptr+1) % delay;
++		for(int p=0; p<ports; ++p) {
++			dout[p].write((pipeline[p])[pipe_ptr]);
++		}
++	}
++public:
++	static const int Ports = ports;
++	static const int Width = width;
++	static const int DepthLog2 = depthLog2;
++	static const int Delay = delay;
++
++	sc_in<bool> clk;
++	sc_in<bool> ena[ports];
++	sc_in<Addr> addr[ports];
++	sc_in<Row>  din[ports];
++	sc_in<bool> we[ports];
++	sc_out<Row> dout[ports];
++
++	SRAM(const sc_module_name &name)
++	: sc_module(name)
++	{
++		SC_METHOD(work); sensitive << clk.pos();
++	}
++};
++
++#endif
+diff --git a/systemc/testbench.c b/systemc/testbench.c
+new file mode 100644
+index 0000000..e634fcb
+--- /dev/null
++++ b/systemc/testbench.c
+@@ -0,0 +1,13 @@
++#include "wrapper.h"
++#include "top.h"
++
++int main(int argc, char **argv, char **envp) {
++	systemc_reset();
++	systemc_clock();
++	systemc_clock();
++	systemc_clock();
++	systemc_clock();
++	systemc_clock();
++	systemc_clock();
++	return 0;
++}
+diff --git a/systemc/top.h b/systemc/top.h
+new file mode 100644
+index 0000000..3f5aa57
+--- /dev/null
++++ b/systemc/top.h
+@@ -0,0 +1,70 @@
++#ifndef _TOP_H
++#define _TOP_H
++
++#include "systemc"
++#include "cache.h"
++#include "sram.h"
++
++using namespace sc_core;
++using namespace sc_dt;
++
++class Top : public sc_module
++{
++	typedef Top SC_CURRENT_USER_MODULE;
++	
++	CacheProject cache;
++
++	void work() {
++		if (reset) {
++			return;
++		}
++	}
++public:
++	sc_in<bool>             clk;
++	sc_in<bool>             reset;
++
++	sc_out<bool>            port_available[Cache::ports];
++
++	sc_signal<bool>         ena[Cache::ports];
++	sc_signal<bool>         is_insert[Cache::ports];
++	sc_signal<bool>         has_data[Cache::ports];
++	sc_signal<bool>         needs_data[Cache::ports];
++	sc_signal<sc_uint<64> > addr[Cache::ports];
++	sc_signal<sc_uint<64> > data[Cache::ports];
++	sc_signal<bool>         update_state[Cache::ports];
++	sc_signal<sc_uint<8> >  new_state[Cache::ports];
++	sc_signal<bool>         reply_ready[Cache::ports];
++	sc_signal<sc_uint<64> > reply_addr[Cache::ports];
++	sc_signal<sc_bv<8*Cache::block_size> > reply_data[Cache::ports];
++	sc_signal<sc_uint<64> > reply_token[Cache::ports];
++	sc_signal<sc_uint<8> >  reply_state[Cache::ports];
++
++	Top(const sc_module_name &name)
++	:	sc_module(name)
++	,	cache("cache")
++	{
++		cache.clk(clk);
++		cache.reset(reset);
++		for(int p=0; p<Cache::ports; ++p) {
++			port_available[p](cache.port_available[p]);
++			cache.in_ena[p](ena[p]);
++			cache.in_is_insert[p](is_insert[p]);
++			cache.in_has_data[p](has_data[p]);
++			cache.in_needs_data[p](needs_data[p]);
++			cache.in_addr[p](addr[p]);
++			cache.in_data[p](data[p]);
++			cache.in_update_state[p](update_state[p]);
++			cache.in_new_state[p](new_state[p]);
++			cache.out_ready[p](reply_ready[p]);
++			cache.out_addr[p](reply_addr[p]);
++			cache.out_data[p](reply_data[p]);
++			cache.out_token[p](reply_token[p]);
++			cache.out_state[p](reply_state[p]);
++		}
++
++		SC_METHOD(work); sensitive << clk.pos();
++	}
++};
++extern Top top;
++
++#endif
+diff --git a/systemc/wrapper.cpp b/systemc/wrapper.cpp
+new file mode 100644
+index 0000000..27032b3
+--- /dev/null
++++ b/systemc/wrapper.cpp
+@@ -0,0 +1,126 @@
++#include "systemc"
++#include "wrapper.h"
++#include "top.h"
++
++ofstream mylogfile("mylog.log");
++#define sysc_logfile if (0) mylogfile
++
++using namespace sc_core;
++
++sc_time clockcycle(500, SC_PS);
++
++sc_signal<bool> reset;
++sc_clock clk("clk", clockcycle);
++Top top("top");
++
++int systemc_base_port;
++systemc_request_map systemc_requests;
++bool systemc_port_available[Cache::ports];
++std::map<long long, long long> systemc_cache_data;
++void systemc_clock() {
++	sc_start(clockcycle);
++#ifdef ENABLE_SYSTEMC_CACHE
++	systemc_base_port = 0;
++	for(int p=0; p<Cache::ports; ++p) {
++		top.ena[p] = false;
++		systemc_port_available[p] = top.port_available[p].read();
++		if (top.reply_ready[p].read()) {
++			long long physAddress = top.reply_addr[p].read();
++			long long replyToken = top.reply_token[p].read();
++			sysc_logfile << "port:" << p << " reply on " << std::hex << replyToken << " physAddress=" << physAddress << endl;
++			sysc_logfile << "systemc_requests_waiting(" << dec << systemc_requests.size() << "):";
++			for(systemc_request_map::iterator e=systemc_requests.begin(); e!=systemc_requests.end(); ++e) {
++				sysc_logfile << " " << std::hex << e->first;
++			}
++			sysc_logfile << endl;
++			systemc_request_map::iterator req = systemc_requests.find(replyToken);
++			assert(req != systemc_requests.end());
++			req->second.reply_ready = true;
++			req->second.reply_state = top.reply_state[p].read();
++			if (req->second.reply_state == 0xff) {
++				physAddress = 0;
++			} else {
++				long long physData = top.reply_data[p].read().to_uint64();
++				if (req->second.needs_data && systemc_cache_data[replyToken/Cache::block_size] && physData != systemc_cache_data[replyToken/Cache::block_size]) {
++					std::cerr << endl << "Address " << std::hex << replyToken << " was supposed to have " << systemc_cache_data[replyToken/Cache::block_size] << ", but the cache returned " << physData << endl;
++					assert(0);
++				}
++			}
++			req->second.reply_tag = physAddress;
++		}
++	}
++#endif
++}
++
++void systemc_reset() {
++	reset = true;
++	sc_start(clockcycle/2);
++	reset = false;
++	sc_start(clockcycle/2);
++}
++
++struct cache_ent { long long tag; unsigned char state; };
++std::map<long long, cache_ent> cache_contents;
++
++#define rot(x,k) (((x)<<(k)) | ((x)>>(32-(k))))
++long long mix_input = 0xfeeddeadbeeff00d;
++long long  hashme(long long a) {
++	long long b = ~mix_input;
++	long long c = ++mix_input;
++	a -= c;  a ^= rot(c, 4);  c += b;
++	b -= a;  b ^= rot(a, 6);  a += c;
++	c -= b;  c ^= rot(b, 8);  b += a;
++	a -= c;  a ^= rot(c,16);  c += b;
++	b -= a;  b ^= rot(a,19);  a += c;
++	c -= b;  c ^= rot(b, 4);  b += a;
++	return a;
++}
++
++void systemc_request_submit(long long request) {
++#ifdef ENABLE_SYSTEMC_CACHE
++	systemc_request& req(systemc_requests[request]);
++
++	int p;
++	for(p=systemc_base_port; p<Cache::ports; ++p) {
++		if (systemc_port_available[p]) break;
++	}
++	assert(p < Cache::ports);
++	if (req.physAddress == 0) {
++		req.reply_ready = true;
++		req.reply_tag = 0;
++		req.reply_state = 0;
++		return;
++	}
++	sysc_logfile << "port:" << p << " trying " << std::hex << req.physAddress << " type=" << req.type << flush << endl;
++	top.ena[p] = true;
++	top.is_insert[p] = (req.type == systemc_request::SYSTEMC_CACHE_INSERT);
++	top.has_data[p] = req.has_data;
++	if (req.has_data) {
++		assert(!req.needs_data);
++		long long value = hashme(req.physAddress);
++		systemc_cache_data[req.physAddress/Cache::block_size] = value;
++		top.data[p] = value;
++		sysc_logfile << "write:" << p << " trying " << std::hex << req.physAddress << " value=" << value << " type=" << req.type << endl;
++	} else {
++		sysc_logfile << "read:" << p << " trying " << std::hex << req.physAddress << " type=" << req.type << endl;
++	}
++	top.needs_data[p] = req.needs_data;
++	top.addr[p] = req.physAddress;
++	top.update_state[p] = req.update_state;
++	top.new_state[p] = req.new_state;
++	systemc_base_port = p+1;
++#endif
++}
++
++int sc_main(int argc, char **argv) {
++	mylogfile.rdbuf()->pubsetbuf(0,0);
++
++	top.clk(clk);
++	top.reset(reset);
++
++	sc_start(SC_ZERO_TIME);
++	reset = true;
++
++	systemc_main(argc, argv, NULL);
++	return 0;
++}
+diff --git a/systemc/wrapper.h b/systemc/wrapper.h
+new file mode 100644
+index 0000000..75e2cfc
+--- /dev/null
++++ b/systemc/wrapper.h
+@@ -0,0 +1,30 @@
++#ifdef __cplusplus
++extern "C" {
++#endif
++#define main systemc_main
++int main(int argc, char **argv, char **envp);
++void systemc_clock(void);
++void systemc_reset(void);
++#ifdef __cplusplus
++}
++
++#include <map>
++void systemc_request_submit(long long request);
++struct systemc_request {
++	enum { SYSTEMC_CACHE_PROBE, SYSTEMC_CACHE_INSERT } type;
++	bool has_data;
++	bool needs_data;
++	long long physAddress;
++	bool update_state;
++	unsigned char new_state;
++	bool sent;
++	bool reply_ready;
++	unsigned char reply_state;
++	long long reply_tag;
++	systemc_request(): sent(false), reply_ready(false) { }
++};
++typedef std::map<long long, systemc_request> systemc_request_map;
++extern systemc_request_map systemc_requests;
++extern int systemc_base_port;
++extern bool systemc_port_available[];
++#endif
