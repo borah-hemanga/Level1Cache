@@ -368,8 +368,10 @@ int CacheController::access_fast_path(Interconnect *interconnect,
         return -1;
     }
 
+    bool dummy;
     if (request->get_type() != MEMORY_OP_WRITE)
-        hit = cacheLines_->probe(request);
+    if (cacheLines_->has_fast_path())
+        hit = cacheLines_->probe(request, false, 0, dummy);
 
 	// TESTING
     //	hit = true;
@@ -488,10 +490,13 @@ bool CacheController::cache_insert_cb(void *arg)
         goto retry_insert;
     }
 
-	if(cacheLines_->get_port(queueEntry->request)) {
+	if(queueEntry->sent || cacheLines_->get_port(queueEntry->request)) {
 		W64 oldTag = InvalidTag<W64>::INVALID;
+		bool ready;
 		CacheLine *line = cacheLines_->insert(queueEntry->request,
-				oldTag);
+				oldTag, LINE_VALID, cacheLines_->tagOf(queueEntry->request->get_physical_address()), ready);
+		if (!cacheLines_->has_fast_path()) queueEntry->sent = true;
+		if (!ready) goto retry_insert;
 		if(oldTag != InvalidTag<W64>::INVALID && oldTag != (W64)-1) {
             if(wt_disabled_ && line->state == LINE_MODIFIED) {
                 send_update_message(queueEntry, oldTag);
@@ -503,6 +508,7 @@ bool CacheController::cache_insert_cb(void *arg)
                     get_physical_address()));
 
 		queueEntry->eventFlags[CACHE_INSERT_COMPLETE_EVENT]++;
+		queueEntry->sent = false;
 		marss_add_event(&cacheInsertComplete_,
 				cacheAccessLatency_, queueEntry);
 		return true;
@@ -538,15 +544,20 @@ bool CacheController::cache_access_cb(void *arg)
 
 	queueEntry->eventFlags[CACHE_ACCESS_EVENT]--;
 
-	if(cacheLines_->get_port(queueEntry->request)) {
-		CacheLine *line = cacheLines_->probe(queueEntry->request);
+	bool ready;
+	CacheLine *line;
+	OP_TYPE type = queueEntry->request->get_type();
+	if(
+		(queueEntry->sent || cacheLines_->get_port(queueEntry->request))
+		&& (((line = cacheLines_->probe(queueEntry->request, (wt_disabled_ && (type == MEMORY_OP_WRITE || type == MEMORY_OP_UPDATE)) || (type == MEMORY_OP_EVICT && is_private()), (type == MEMORY_OP_EVICT)?LINE_NOT_VALID:LINE_MODIFIED, ready)) || (true)) && (cacheLines_->has_fast_path() || (queueEntry->sent = true)))
+		&& ready
+	) {
 		bool hit = (line == NULL) ? false : line->state;
 
 		// Testing 100 % L2 Hit
         //		if(type_ == L2_CACHE)
         //			hit = true;
 
-		OP_TYPE type = queueEntry->request->get_type();
 		bool kernel_req = queueEntry->request->is_kernel();
 		Signal *signal = NULL;
 		int delay;
@@ -638,6 +649,7 @@ bool CacheController::cache_access_cb(void *arg)
                 }
 			}
 		}
+		queueEntry->sent = false;
 		marss_add_event(signal, delay,
 				(void*)queueEntry);
 		return true;

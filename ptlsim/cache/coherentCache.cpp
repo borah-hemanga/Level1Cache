@@ -366,8 +366,9 @@ bool CacheController::complete_request(Message &message,
     if(queueEntry->line == NULL || queueEntry->line->tag !=
             cacheLines_->tagOf(queueEntry->request->get_physical_address())) {
         W64 oldTag = InvalidTag<W64>::INVALID;
+        bool dummy;
         CacheLine *line = cacheLines_->insert(queueEntry->request,
-                oldTag);
+                oldTag, 0, 0, dummy);
 
         /* If line is in use then don't evict it, it will be inserted later. */
         if (is_line_in_use(oldTag)) {
@@ -425,8 +426,9 @@ int CacheController::access_fast_path(Interconnect *interconnect,
         return -1;
     }
 
+    bool dummy;
     if (request->get_type() != MEMORY_OP_WRITE)
-        line = cacheLines_->probe(request);
+        line = cacheLines_->probe(request, false, 0, dummy);
 
     /*
      * if its a write, dont do fast access as the lower
@@ -636,7 +638,8 @@ bool CacheController::cache_access_cb(void *arg)
 
     if(cacheLines_->get_port(queueEntry->request)) {
         bool hit;
-        CacheLine *line	= cacheLines_->probe(queueEntry->request);
+        bool dummy;
+        CacheLine *line	= cacheLines_->probe(queueEntry->request, false, 0, dummy);
         queueEntry->line = line;
 
         if(line) hit = true;

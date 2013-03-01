@@ -114,6 +114,8 @@ int main(int argc, char **argv)
 #define main qemu_main
 #endif /* CONFIG_COCOA */
 
+#include "systemc/wrapper.h"
+
 #include "hw/hw.h"
 #include "hw/boards.h"
 #include "hw/usb.h"
@@ -1453,6 +1455,7 @@ static void main_loop(void)
 #endif
             nonblocking = cpu_exec_all();
 #ifdef MARSS_QEMU
+#define main systemc_main
             }
 #endif
 #endif

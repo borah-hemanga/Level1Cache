@@ -29,6 +29,10 @@
 #define CACHE_LINES_H
 
 #include <logic.h>
+#include "systemc/wrapper.h"
+
+extern ofstream mylogfile;
+#define cacheline_logfile if (0) mylogfile
 
 namespace Memory {
 
@@ -38,6 +42,9 @@ namespace Memory {
         /* This is a generic variable used by all caches to represent its
          * coherence state */
         W8 state;
+
+        CacheLine(): tag(-1), state(0) { }
+        CacheLine(W64 _tag, W8 _state): tag(_tag), state(_state) { }
 
         void init(W64 tag_t) {
             tag = tag_t;
@@ -77,18 +84,18 @@ namespace Memory {
             virtual void init()=0;
             virtual W64 tagOf(W64 address)=0;
             virtual int latency() const =0;
-            virtual CacheLine* probe(MemoryRequest *request)=0;
-            virtual CacheLine* insert(MemoryRequest *request,
-                    W64& oldTag)=0;
+            virtual CacheLine* probe(MemoryRequest *request, bool update_state, W8 new_state, bool& ready)=0;
+            virtual CacheLine* insert(MemoryRequest *request, W64& oldTag, W8 new_state, W64 new_tag, bool& ready)=0;
             virtual int invalidate(MemoryRequest *request)=0;
+            virtual bool has_fast_path()=0;
             virtual bool get_port(MemoryRequest *request)=0;
             virtual void print(ostream& os) const =0;
             virtual int get_line_bits() const=0;
             virtual int get_access_latency() const=0;
-			virtual int get_size() const=0;
-			virtual int get_set_count() const=0;
-			virtual int get_way_count() const=0;
-			virtual int get_line_size() const=0;
+            virtual int get_size() const=0;
+            virtual int get_set_count() const=0;
+            virtual int get_way_count() const=0;
+            virtual int get_line_size() const=0;
     };
 
     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
@@ -101,7 +108,9 @@ namespace Memory {
             int writePortUsed_;
             int readPorts_;
             int writePorts_;
+            bool systemc_proxy;
             W64 lastAccessCycle_;
+            CacheLine templine;
 
         public:
             typedef AssociativeArray<W64, CacheLine, SET_COUNT,
@@ -114,47 +123,48 @@ namespace Memory {
             void init();
             W64 tagOf(W64 address);
             int latency() const { return LATENCY; };
-            CacheLine* probe(MemoryRequest *request);
-            CacheLine* insert(MemoryRequest *request, W64& oldTag);
+            CacheLine* probe(MemoryRequest *request, bool update_state, W8 new_state, bool& ready);
+            CacheLine* insert(MemoryRequest *request, W64& oldTag, W8 new_state, W64 new_tag, bool& ready);
             int invalidate(MemoryRequest *request);
+            bool has_fast_path();
             bool get_port(MemoryRequest *request);
             void print(ostream& os) const;
 
-			/**
-			 * @brief Get Cache Size
-			 *
-			 * @return Size of Cache in bytes
-			 */
-			int get_size() const {
-				return (SET_COUNT * WAY_COUNT * LINE_SIZE);
-			}
+            /**
+             * @brief Get Cache Size
+             *
+             * @return Size of Cache in bytes
+             */
+            int get_size() const {
+              return (SET_COUNT * WAY_COUNT * LINE_SIZE);
+            }
 
-			/**
-			 * @brief Get Number of Sets in Cache
-			 *
-			 * @return Sets in Cache
-			 */
-			int get_set_count() const {
-				return SET_COUNT;
-			}
+            /**
+             * @brief Get Number of Sets in Cache
+             *
+             * @return Sets in Cache
+             */
+            int get_set_count() const {
+              return SET_COUNT;
+            }
 
-			/**
-			 * @brief Get Cache Lines per Set (Number of Ways)
-			 *
-			 * @return Number of Cache Lines in one Set
-			 */
-			int get_way_count() const {
-				return WAY_COUNT;
-			}
+            /**
+             * @brief Get Cache Lines per Set (Number of Ways)
+             *
+             * @return Number of Cache Lines in one Set
+             */
+            int get_way_count() const {
+              return WAY_COUNT;
+            }
 
-			/**
-			 * @brief Get number of bytes in a cache line
-			 *
-			 * @return Number of bytes in Cache Line
-			 */
-			int get_line_size() const {
-				return LINE_SIZE;
-			}
+            /**
+             * @brief Get number of bytes in a cache line
+             *
+             * @return Number of bytes in Cache Line
+             */
+            int get_line_size() const {
+              return LINE_SIZE;
+            }
 
             int get_line_bits() const {
                 return log2(LINE_SIZE);
@@ -187,10 +197,15 @@ namespace Memory {
         CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::CacheLines(int readPorts, int writePorts) :
             readPorts_(readPorts)
             , writePorts_(writePorts)
+            , systemc_proxy(false)
     {
         lastAccessCycle_ = 0;
         readPortUsed_ = 0;
         writePortUsed_ = 0;
+        if (writePorts < 0) {
+          writePorts_ = -writePorts_;
+          systemc_proxy = true;
+        }
     }
 
     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
@@ -213,34 +228,111 @@ namespace Memory {
 
     // Return true if valid line is found, else return false
     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
-        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::probe(MemoryRequest *request)
+        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::probe(MemoryRequest *request, bool update_state, W8 new_state, bool& ready)
         {
             W64 physAddress = request->get_physical_address();
+            if (systemc_proxy) {
+              cacheline_logfile << "probe: " << *request << " update_state: " << update_state << " new_state: " << (int)new_state << " physAddress=" << physAddress << endl;
+              systemc_request& req(systemc_requests[physAddress]);
+              if (!req.sent) {
+                  cacheline_logfile << "sending probe..." << endl;
+                  req.type = systemc_request::SYSTEMC_CACHE_PROBE;
+                  OP_TYPE type = request->get_type();
+                  req.has_data = ((type == MEMORY_OP_WRITE) || (type == MEMORY_OP_UPDATE)) ;
+                  req.needs_data = (type == MEMORY_OP_READ);
+                  req.physAddress = physAddress;
+                  req.update_state = update_state;
+                  req.new_state = new_state;
+                  systemc_request_submit(physAddress);
+                  req.sent = true;
+                  ready = false;
+                  return NULL;
+              }
+              ready = req.reply_ready;
+              cacheline_logfile << "sent, ready? " << ready << " reply_tag: " << std::hex << req.reply_tag << endl;
+              templine.tag = req.reply_tag;
+              templine.state = req.reply_state;
+              if (ready) {
+                req.sent = false;
+                systemc_requests.erase(physAddress);
+                cacheline_logfile << "systemc_requests.size() == " << systemc_requests.size() << endl;
+              }
+              if (templine.tag == 0) return NULL;
+              if (ready) cacheline_logfile << "... hit" << endl;
+              return &templine;
+            }
             CacheLine *line = base_t::probe(physAddress);
 
+            ready = true;
             return line;
         }
 
     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
-        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::insert(MemoryRequest *request, W64& oldTag)
+        CacheLine* CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::insert(MemoryRequest *request, W64& oldTag, W8 new_state, W64 new_tag, bool& ready)
         {
             W64 physAddress = request->get_physical_address();
+            if (systemc_proxy) {
+              cacheline_logfile << "insert: " << *request << " new_state: " << (int)new_state << endl;
+              systemc_request& req(systemc_requests[physAddress]);
+              if (!req.sent) {
+                  cacheline_logfile << "sending insert..." << endl;
+                  req.type = systemc_request::SYSTEMC_CACHE_INSERT;
+                  req.has_data = true;
+                  req.needs_data = false;
+                  req.physAddress = physAddress;
+                  req.update_state = true;
+                  req.new_state = new_state;
+                  systemc_request_submit(physAddress);
+                  req.sent = true;
+                  ready = false;
+                  return NULL;
+              }
+              ready = req.reply_ready;
+              cacheline_logfile << "sent, ready? " << ready << " reply_tag: " << std::hex << req.reply_tag << endl;
+              templine.tag = oldTag = req.reply_tag;
+              templine.state = req.reply_state;
+              if (ready) {
+                req.sent = false;
+                systemc_requests.erase(physAddress);
+                assert(systemc_requests.size() < 1000);
+                cacheline_logfile << "systemc_requests.size() == " << systemc_requests.size() << endl;
+              }
+              return &templine;
+            }
             CacheLine *line = base_t::select(physAddress, oldTag);
 
+            ready = true;
             return line;
         }
 
     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
         int CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::invalidate(MemoryRequest *request)
         {
+            assert(!systemc_proxy);
             return base_t::invalidate(request->get_physical_address());
         }
 
+    template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
+        bool CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::has_fast_path()
+        {
+            return !systemc_proxy;
+        }
 
     template <int SET_COUNT, int WAY_COUNT, int LINE_SIZE, int LATENCY>
         bool CacheLines<SET_COUNT, WAY_COUNT, LINE_SIZE, LATENCY>::get_port(MemoryRequest *request)
         {
             bool rc = false;
+
+            if (systemc_proxy) {
+                for(int p=systemc_base_port; p<(readPorts_+writePorts_); ++p) {
+                    if (systemc_port_available[p])  {
+cacheline_logfile << "getport: " << *request << " available on " << p << endl;
+												return true;
+										}
+								}
+cacheline_logfile << "getport: " << *request << " all busy" << endl;
+                return false;
+            }
 
             if(lastAccessCycle_ < sim_cycle) {
                 lastAccessCycle_ = sim_cycle;
@@ -251,6 +343,9 @@ namespace Memory {
             switch(request->get_type()) {
                 case MEMORY_OP_READ:
                     rc = (readPortUsed_ < readPorts_) ? ++readPortUsed_ : 0;
+                    if (!rc) {
+                        rc = (writePortUsed_ < writePorts_) ? ++writePortUsed_ : 0;
+                    }
                     break;
                 case MEMORY_OP_WRITE:
                 case MEMORY_OP_UPDATE:
@@ -262,6 +357,7 @@ namespace Memory {
                             request->get_type() << endl);
                     assert(0);
             };
+
             return rc;
         }
 

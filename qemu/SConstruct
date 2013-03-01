@@ -5,6 +5,7 @@ Import('qemu_env')
 Import('qemu_target')
 Import('ptlsim_lib')
 Import('plugins')
+Import('hwlib')
 Import('ptlsim_inc_dir')
 import subprocess
 import re
@@ -483,7 +484,8 @@ env.Append(LIBPATH = "%s/../plugins" % env['source_path'])
 env.Append(LINKFLAGS = "-Wl,-rpath=%s/../plugins" % env['source_path'])
 env.Append(LINKFLAGS = "-Wl,--no-as-needed")
 env.Append(LIBS = plugins)
-env['ARLIB'] = libqemu_comm + libqemu + ptlsim_lib
+env.Append(LINKFLAGS = "-Wl,-rpath=/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -L/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -lsystemc")
+env['ARLIB'] = libqemu_comm + libqemu + ptlsim_lib + hwlib
 qemu_bin = env.QEMU_BIN(qemu_prog_name, hw_files_o + pc_bios_objs +
         trace_o)
 env.Depends(qemu_bin, env['ARLIB'])

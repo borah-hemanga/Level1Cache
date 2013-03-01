@@ -78,6 +78,7 @@ struct CacheQueueEntry : public FixStateListObject
 		Controller    *source;
 		Controller    *dest;
 		bool annuled;
+		bool sent;
 		bool prefetch;
 		bool prefetchCompleted;
 
@@ -91,6 +92,7 @@ struct CacheQueueEntry : public FixStateListObject
             dependsAddr = -1;
 			eventFlags.reset();
 			annuled = false;
+			sent = false;
 			prefetch = false;
 			prefetchCompleted = false;
 		}

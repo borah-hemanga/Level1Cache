@@ -342,11 +342,11 @@ namespace superstl {
       memcpy(os.p, buf, len);
       os.p += len;
       width = max(width - len, 0);
-      memset(os.p, ' ', width);
+      if (width) memset(os.p, ' ', width);
       os.p += width;
     } else {
       width = max(width - len, 0);
-      memset(os.p, ' ', width);
+      if (width) memset(os.p, ' ', width);
       os.p += width;
       memcpy(os.p, buf, len);
       os.p += len;
@@ -369,11 +369,11 @@ namespace superstl {
       memcpy(os.p, buf, len);
       os.p += len;
       width = max(width - len, 0);
-      memset(os.p, ' ', width);
+      if (width) memset(os.p, ' ', width);
       os.p += width;
     } else {
       width = max(width - len, 0);
-      memset(os.p, ' ', width);
+      if (width) memset(os.p, ' ', width);
       os.p += width;
       memcpy(os.p, buf, len);
       os.p += len;
@@ -395,11 +395,11 @@ namespace superstl {
       memcpy(os.p, s.value, len);
       os.p += len;
       width = max(width - len, 0);
-      memset(os.p, s.pad, width);
+      if (width) memset(os.p, s.pad, width);
       os.p += width;
     } else {
       width = max(width - len, 0);
-      memset(os.p, s.pad, width);
+      if (width) memset(os.p, s.pad, width);
       os.p += width;
       memcpy(os.p, s.value, len);
       os.p += len;

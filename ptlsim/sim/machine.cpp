@@ -18,6 +18,8 @@
 
 #include <cstdarg>
 
+#include "systemc/wrapper.h"
+
 using namespace Core;
 using namespace Memory;
 
@@ -229,6 +231,7 @@ int BaseMachine::run(PTLsimConfig& config)
     // Run each core
     bool exiting = false;
 
+    systemc_reset();
     for (;;) {
         if unlikely ((!logenable) &&
                 iterations >= config.start_log_at_iteration &&
@@ -265,6 +268,7 @@ int BaseMachine::run(PTLsimConfig& config)
 			exiting |= coremodel.per_cycle_signals[i]->emit(NULL);
 		}
 
+        systemc_clock();
         sim_cycle++;
         iterations++;
 
