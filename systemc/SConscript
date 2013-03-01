@@ -1,0 +1,27 @@
+# SConscript for plugins subdirectory
+
+# Import envrionment
+try:
+	Import('ptl_env')
+	env = ptl_env
+except:
+    print("Plugin directory can't get base environment")
+    exit(0)
+
+import os
+from subprocess import call
+
+env['CPPPATH'].append("/home/stufs1/crfitzsimons/cse502/systemc/include")
+
+# Get list of .cpp files
+src_files = Glob('*.cpp')
+
+hwlib = env.SharedLibrary(target='hwlib', source=src_files)
+
+testbench = env.Clone();
+testbench.Append(LINKFLAGS = "-Wl,-rpath=/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -L/home/stufs1/crfitzsimons/cse502/systemc/lib-linux64 -lsystemc")
+testbench.Append(LINKFLAGS = "-Wl,-rpath=%s -L%s -lhwlib" % (os.getcwd(),os.getcwd()))
+tb = testbench.Program(target = "testbench", source = ["testbench.c"]);
+testbench.Depends(tb, hwlib)
+
+Return('hwlib')
