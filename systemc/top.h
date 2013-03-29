@@ -15,6 +15,23 @@ class Top : public sc_module
 	CacheProject cache;
 
 	void work() {
+		for(int p=0; p<Cache::ports; ++p) {
+//		    ena[p] = true;
+//		    ena[p] = false;
+		    cout << " --------TOP ------------------" << endl;
+		    cout << " IS_INSERT " << is_insert[p] << endl;
+		    cout << " HAS_DATA " << has_data[p] << endl;
+		    cout << " NEEDS_DATA " << needs_data[p] << endl;
+		    cout << " ADDR " << addr[p] << endl;
+//		    cout << " DATA " << data[p] << endl;
+		    cout << " UPDATE-STATE " << update_state[p] << endl;
+		    cout << " NEW-STATE " << new_state[p] << endl;
+		    cout << " REPLY READY " << reply_ready[p] << endl;
+		    cout << " REPLY  ADDR " << reply_addr[p] << endl;
+                    cout << " REPLY TOKEN : " << reply_token[p].read();
+		    cout << " -------------------------" << endl;
+		    cout << endl ;
+                }
 		if (reset) {
 			return;
 		}
@@ -30,7 +47,8 @@ public:
 	sc_signal<bool>         has_data[Cache::ports];
 	sc_signal<bool>         needs_data[Cache::ports];
 	sc_signal<sc_uint<64> > addr[Cache::ports];
-	sc_signal<sc_uint<64> > data[Cache::ports];
+	//sc_signal<sc_uint<64> > data[Cache::ports];
+	sc_signal<sc_bv<8 * Cache::block_size> > data[Cache::ports];
 	sc_signal<bool>         update_state[Cache::ports];
 	sc_signal<sc_uint<8> >  new_state[Cache::ports];
 	sc_signal<bool>         reply_ready[Cache::ports];

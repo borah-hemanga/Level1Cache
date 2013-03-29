@@ -120,7 +120,7 @@ int sc_main(int argc, char **argv) {
 
 	sc_start(SC_ZERO_TIME);
 	reset = true;
-
+	
 	systemc_main(argc, argv, NULL);
 	return 0;
 }
